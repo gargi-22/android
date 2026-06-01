@@ -1,89 +1,79 @@
-from flask import Flask, request, Response
-import numpy as np
+import cv2
+import requests
+import time
 import threading
+import queue
  
-app = Flask(__name__)
+SERVER_URL = "https://middleware-server-10.onrender.com/upload_1"
  
-CAM_IDS = ["cam1", "cam2", "cam3", "cam4"]
+# Queue holds at most 1 frame — always the freshest one
+frame_queue = queue.Queue(maxsize=1)
  
-class CamBuffer:
-    def __init__(self):
-        self.data    = None
-        self.counter = 0
-        self.lock    = threading.Lock()
-        self.cond    = threading.Condition(self.lock)
+# Shared state for adaptive quality
+upload_state = {"quality": 60, "slow_count": 0}
  
-    def write(self, jpeg_bytes):
-        with self.cond:
-            self.data    = jpeg_bytes
-            self.counter += 1
-            self.cond.notify_all()   # wake ALL waiting viewers at once
+def capture_loop():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
  
-    def read(self, last_counter):
-        with self.cond:
-            # wait only if viewer already has this frame
-            self.cond.wait_for(lambda: self.counter != last_counter, timeout=2)
-            return self.data, self.counter
- 
-buffers = {cam: CamBuffer() for cam in CAM_IDS}
- 
-PLACEHOLDER = None
-def placeholder():
-    global PLACEHOLDER
-    if PLACEHOLDER is None:
-        import cv2
-        img = np.zeros((240, 320, 3), dtype=np.uint8)
-        cv2.putText(img, "Waiting...", (80, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
-        PLACEHOLDER = buf.tobytes()
-    return PLACEHOLDER
- 
- 
-@app.route("/upload_1", methods=["POST"])
-def upload():
-    cam_id = request.form.get("cam_id", "cam1")
-    if cam_id not in buffers:
-        return "Bad cam_id", 400
-    file = request.files.get("frame")
-    if not file:
-        return "No frame", 400
-    buffers[cam_id].write(file.read())   # store raw JPEG, no re-encode
-    return "OK"
- 
- 
-def generate(cam_id):
-    last = 0
     while True:
-        data, last = buffers[cam_id].read(last)
-        if data is None:
-            data = placeholder()
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' +
-            data +
-            b'\r\n'
+        ret, frame = cap.read()
+        if not ret:
+            continue
+ 
+        quality = upload_state["quality"]
+        _, img_encoded = cv2.imencode(
+            '.jpg', frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         )
  
+        try:
+            # Drop stale frame if uploader hasn't consumed it yet
+            frame_queue.put_nowait(img_encoded.tobytes())
+        except queue.Full:
+            pass  # Skip — uploader is busy, don't queue stale frames
  
-@app.route("/video_feed/<cam_id>")
-def video_feed(cam_id):
-    if cam_id not in buffers:
-        return "Bad cam_id", 404
-    return Response(
-        generate(cam_id),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+        time.sleep(0.005)  # ~30 FPS cap
  
- 
-@app.route("/")
-def home():
-    base = request.host_url.rstrip("/")
-    return {
-        "status": "Live",
-        "streams": {cam: f"{base}/video_feed/{cam}" for cam in CAM_IDS}
-    }
+    cap.release()
  
  
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+def upload_loop():
+    session = requests.Session()  # Reuse TCP connection (keep-alive)
+ 
+    while True:
+        frame_bytes = frame_queue.get()  # Block until a frame is ready
+ 
+        t0 = time.monotonic()
+        try:
+            session.post(
+                SERVER_URL,
+                files={"frame": frame_bytes},
+                timeout=2
+            )
+            elapsed = time.monotonic() - t0
+ 
+            # Adaptive quality: recover if fast, drop if slow
+            if elapsed < 0.08:
+                upload_state["slow_count"] = 0
+                upload_state["quality"] = min(60, upload_state["quality"] + 2)
+            else:
+                upload_state["slow_count"] += 1
+                if upload_state["slow_count"] > 3:
+                    upload_state["quality"] = max(20, upload_state["quality"] - 5)
+ 
+        except Exception as e:
+            print(f"Upload failed ({upload_state['quality']}q): {e}")
+            upload_state["quality"] = max(20, upload_state["quality"] - 10)
+ 
+ 
+# Start both threads
+threading.Thread(target=capture_loop, daemon=True).start()
+threading.Thread(target=upload_loop, daemon=True).start()
+ 
+# Keep main thread alive
+while True:
+    time.sleep(1)
+ 

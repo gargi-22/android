@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: middleware-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server_Code:app
