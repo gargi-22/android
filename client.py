@@ -5,31 +5,42 @@ import threading
 import queue
 
 SERVER_URL = "https://android-1-6m4p.onrender.com/upload_1"
-CAM_ID = "cam1"  # ← set which camera this device is
+CAM_ID = "cam1"
+
+# ✅ Point to your video file instead of webcam (0)
+VIDEO_PATH = "VID_20260601_162529.mp4"
 
 frame_queue = queue.Queue(maxsize=1)
 upload_state = {"quality": 60, "slow_count": 0}
 
-def capture_loop():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
+def capture_loop():
+    while True:  # Loop the video forever
+        cap = cv2.VideoCapture(VIDEO_PATH)
+
+        if not cap.isOpened():
+            print("Cannot open video file")
+            time.sleep(1)
             continue
 
-        try:
-            frame_queue.put_nowait(frame)  # put raw frame, not encoded
-        except queue.Full:
-            pass
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        delay = 1.0 / fps
 
-        time.sleep(0.033)  # ~30 FPS
+        while True:
+            ret, frame = cap.read()
 
-    cap.release()
+            if not ret:
+                # End of video — restart from beginning
+                break
+
+            try:
+                frame_queue.put_nowait(frame)
+            except queue.Full:
+                pass
+
+            time.sleep(delay)
+
+        cap.release()
 
 
 def upload_loop():
@@ -47,9 +58,9 @@ def upload_loop():
 
         t0 = time.monotonic()
         try:
-            resp = session.post(
+            session.post(
                 SERVER_URL,
-                data={"cam_id": CAM_ID},   # ✅ THIS WAS MISSING
+                data={"cam_id": CAM_ID},
                 files={"frame": ("frame.jpg", frame_bytes, "image/jpeg")},
                 timeout=2
             )
