@@ -52,7 +52,6 @@ def upload():
     return "OK", 200
 
 
-# ✅ New: single JPEG frame endpoint — JS polls this repeatedly
 @app.route("/frame/<cam_id>")
 def get_frame(cam_id):
     if cam_id not in buffers:
@@ -69,12 +68,49 @@ def get_frame(cam_id):
         mimetype='image/jpeg',
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
-            "X-Frame-Counter": str(counter)   # JS reads this to track frame number
+            "X-Frame-Counter": str(counter)
         }
     )
 
 
-# ✅ HTML page with JS polling loop — works in ALL browsers
+def generate(cam_id):
+    last = 0
+    while True:
+        try:
+            data, last = buffers[cam_id].read(last)
+            if data is None:
+                data = get_placeholder()
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' +
+                data +
+                b'\r\n'
+            )
+        except Exception:
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' +
+                get_placeholder() +
+                b'\r\n'
+            )
+
+
+@app.route("/stream/<cam_id>")
+def stream(cam_id):
+    if cam_id not in buffers:
+        return "Bad cam_id", 404
+    return Response(
+        generate(cam_id),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive"
+        }
+    )
+
+
 @app.route("/video_feed/<cam_id>")
 def video_feed(cam_id):
     if cam_id not in buffers:
@@ -82,13 +118,13 @@ def video_feed(cam_id):
 
     base = request.host_url.rstrip("/")
 
-    html = f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html>
 <head>
-    <title>Live - {cam_id}</title>
+    <title>Live - """ + cam_id + """</title>
     <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
             background: #111;
             display: flex;
             flex-direction: column;
@@ -97,32 +133,32 @@ def video_feed(cam_id):
             min-height: 100vh;
             font-family: Arial, sans-serif;
             color: #fff;
-        }}
-        #feed {{
+        }
+        #feed {
             width: 100%;
             max-width: 800px;
             border-radius: 8px;
             display: block;
             background: #000;
-        }}
-        #bar {{
+        }
+        #bar {
             display: flex;
             align-items: center;
             gap: 12px;
             margin-bottom: 10px;
             font-size: 14px;
-        }}
-        #dot {{
+        }
+        #dot {
             width: 10px; height: 10px;
             border-radius: 50%;
             background: #f00;
-        }}
-        #dot.live {{ background: #0f0; animation: pulse 1s infinite; }}
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.3; }}
-        }}
-        #fps {{ color: #aaa; font-size: 12px; margin-top: 6px; }}
+        }
+        #dot.live { background: #0f0; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        #fps { color: #aaa; font-size: 12px; margin-top: 6px; }
     </style>
 </head>
 <body>
@@ -134,47 +170,40 @@ def video_feed(cam_id):
     <div id="fps">0 fps</div>
 
     <script>
-        const CAM_ID  = "{cam_id}";
-        const BASE    = "{base}";
+        const CAM_ID  = \"""" + cam_id + """\";
+        const BASE    = \"""" + base + """\";
         const img     = document.getElementById('feed');
         const dot     = document.getElementById('dot');
         const statusT = document.getElementById('statusText');
         const fpsDiv  = document.getElementById('fps');
 
         let lastCounter = 0;
-        let running     = true;
         let frameCount  = 0;
         let lastFpsTime = Date.now();
         let errors      = 0;
 
-        // FPS counter
-        setInterval(() => {{
+        setInterval(() => {
             const now = Date.now();
             const elapsed = (now - lastFpsTime) / 1000;
             const fps = (frameCount / elapsed).toFixed(1);
             fpsDiv.innerText = fps + ' fps';
             frameCount = 0;
             lastFpsTime = now;
-        }}, 2000);
+        }, 2000);
 
-        async function fetchFrame() {{
-            if (!running) return;
-
-            try {{
+        async function fetchFrame() {
+            try {
                 const url = BASE + '/frame/' + CAM_ID + '?last=' + lastCounter + '&t=' + Date.now();
                 const resp = await fetch(url);
 
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
-                // Read frame counter from header
                 const counter = resp.headers.get('X-Frame-Counter');
                 if (counter) lastCounter = parseInt(counter);
 
-                // Convert response to blob URL and update image
                 const blob = await resp.blob();
                 const objUrl = URL.createObjectURL(blob);
 
-                // Revoke old blob URL to free memory
                 if (img._blobUrl) URL.revokeObjectURL(img._blobUrl);
                 img._blobUrl = objUrl;
                 img.src = objUrl;
@@ -182,20 +211,19 @@ def video_feed(cam_id):
                 frameCount++;
                 errors = 0;
                 dot.className = 'live';
-                statusT.innerText = '{cam_id.upper()} — LIVE';
+                statusT.innerText = '""" + cam_id.upper() + """ — LIVE';
 
-            }} catch (e) {{
+            } catch (e) {
                 errors++;
                 dot.className = '';
                 statusT.innerText = 'Reconnecting... (' + e.message + ')';
-                await new Promise(r => setTimeout(r, 1000));  // wait before retry
-            }}
+                await new Promise(r => setTimeout(r, 1000));
+            }
 
-            // Immediately fetch next frame (long-poll: server blocks until new frame)
             fetchFrame();
-        }}
+        }
 
-        fetchFrame();  // Start the loop
+        fetchFrame();
     </script>
 </body>
 </html>"""
@@ -208,19 +236,23 @@ def status():
     result = {}
     for cam, buf in buffers.items():
         with buf.lock:
-            result[cam] = {{
+            result[cam] = {
                 "live": buf.data is not None,
                 "frames": buf.counter
-            }}
+            }
     return result
 
 
 @app.route("/")
 def home():
     base = request.host_url.rstrip("/")
+    streams = {cam: base + "/video_feed/" + cam for cam in CAM_IDS}
+    raw = {cam: base + "/stream/" + cam for cam in CAM_IDS}
     return {
-        "streams": {{cam: f"{{base}}/video_feed/{{cam}}" for cam in CAM_IDS}},
-        "status":  f"{{base}}/status"
+        "status": "Live",
+        "viewer_pages": streams,
+        "raw_streams": raw,
+        "status_check": base + "/status"
     }
 
 
